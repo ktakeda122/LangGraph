@@ -2,6 +2,8 @@
 
 A travel-planning agent built with **LangGraph** and **Streamlit**.
 
+🔗 **Source code:** https://github.com/ktakeda122/LangGraph
+
 You describe a trip in plain English, for example *"7 days in Guatemala, El Salvador and Honduras in December"*. The agent then:
 
 1. asks for anything important you left out (where you're going, how many days),
