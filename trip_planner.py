@@ -1,5 +1,5 @@
-"""Trip Planner Agent - Step 5
-LangGraph + Streamlit
+"""Trip Planner Agent - Step 6 (HW 7-2: decision model)
+LangGraph + Streamlit + SemIf
 
 Graph:
     START -> parse_request --(missing info)--> ask_for_details  [interrupt]
@@ -11,20 +11,36 @@ Graph:
     validate_itinerary --(issues found, < MAX_REVISIONS)--> draft_itinerary (revise)
                        --(passed or out of revisions)----> review  [interrupt]
     review --(change request)--> draft_itinerary (revise with the user's feedback)
+           --(question)--> review (answer it, keep the plan, wait again)
            --(approved / new trip)--> END
 
 interrupt() pauses the graph and waits for the user; the state is kept by a
 checkpointer (InMemorySaver) under a thread_id, and the UI resumes the graph
 with Command(resume=<user's reply>).
 
+Decision model (HW 7-2): small yes/no and multiple-choice decisions go to
+SemIf, a local decision model that returns a probability per option instead
+of text (see decisions.py and semif_server.py):
+    review              - is the reply approve / change / new_trip / question,
+                          and does it change the trip length? The LLM is called only when
+                          SemIf is unsure (< ROUTE_CONFIDENCE) or a new trip
+                          length has to be read from the reply.
+    validate_itinerary  - semantic plan checks: does the plan really visit each
+                          destination (when the name doesn't appear literally),
+                          and does it cover each of the user's interests?
+If the SemIf server isn't running, every decision falls back to the LLM or to
+the plain-text rules, as in Step 5.
+
 Run with:
     uv run streamlit run trip_planner.py
+(and, optionally, semif_server.py in the SemIf environment; see README)
 """
 
 import json
 import math
 import operator
 import os
+import re
 import time
 import uuid
 from typing import Annotated, Literal, Optional, TypedDict
@@ -47,6 +63,11 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+# decisions reads SEMIF_URL / SEMIF_TIMEOUT from the environment, so import it
+# after load_dotenv() to pick up values from .env too.
+import decisions as semif  # noqa: E402
+from decisions import ACTION_QUESTION, LENGTH_QUESTION, Decision, question  # noqa: E402
+
 MAX_DAYS = 14             # keep the drafted itinerary a manageable size
 MAX_RESEARCH_ROUNDS = 4   # max rounds of tool calls before the agent must stop
 MAX_STOP_DISTANCE_KM = 150  # a geocoded stop farther than this from its city is a wrong match
@@ -58,10 +79,16 @@ MAX_DAY_ROUTE_KM = 100       # total distance between one day's stops, in visiti
 TRANSFER_KM = 150            # moving this far between cities makes it a travel day...
 MAX_STOPS_ON_TRANSFER_DAY = 2  # ...which should be light
 
+# Decision model (SemIf). Its probabilities are not calibrated out of the box,
+# so these thresholds should be tuned on your own examples (eval_router.py).
+ROUTE_CONFIDENCE = 0.90   # below this, the review router asks the LLM instead
+CHECK_CONFIDENCE = 0.80   # a semantic plan check changes the result only above this
+MAX_INTEREST_CHECKS = 5   # interests checked per plan (one SemIf question each)
+
 # Wikipedia and OpenStreetMap both ask for a descriptive User-Agent with a way
 # to contact you. Put CONTACT_EMAIL=you@example.com in your .env file.
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip()
-USER_AGENT = "TripPlannerAgent/0.5 (MPCS 57200 coursework" + (
+USER_AGENT = "TripPlannerAgent/0.6 (MPCS 57200 coursework" + (
     f"; {CONTACT_EMAIL})" if CONTACT_EMAIL else ")"
 )
 wikipedia.set_user_agent(USER_AGENT)
@@ -89,7 +116,11 @@ class TripRequest(BaseModel):
 
 
 class Stop(BaseModel):
-    name: str = Field(description="Specific place name, e.g. 'Fushimi Inari Taisha'")
+    name: str = Field(
+        description="The place's official name as it appears on a map, e.g. "
+        "'Fushimi Inari Taisha' or 'Palacio Nacional de la Cultura'. Never a "
+        "description such as 'Historic Center of Guatemala City' or 'a local coffee farm'"
+    )
     note: str = Field(description="One short sentence on what to do there")
 
 
@@ -107,11 +138,12 @@ class Itinerary(BaseModel):
 
 
 class FeedbackDecision(BaseModel):
-    action: Literal["approve", "change", "new_trip"] = Field(
+    action: Literal["approve", "change", "new_trip", "question"] = Field(
         description="'approve' if the traveler is happy and wants no more changes; "
         "'change' if they want to adjust this itinerary, including making the trip "
         "longer or shorter; 'new_trip' if they want different destinations "
-        "(a different place, or adding or dropping a destination)"
+        "(a different place, or adding or dropping a destination); 'question' if "
+        "they ask a question and neither approve nor ask for a change"
     )
     new_days: Optional[int] = Field(
         description="If the traveler asked for a different trip length, the new total "
@@ -120,7 +152,14 @@ class FeedbackDecision(BaseModel):
     instructions: str = Field(
         description="For 'change': the requested changes, restated as clear instructions "
         "for the planner. For 'new_trip': the complete new trip request. "
-        "Empty for 'approve'."
+        "For 'question': the question. Empty for 'approve'."
+    )
+
+
+class LengthChange(BaseModel):
+    new_days: Optional[int] = Field(
+        description="The new total number of days the traveler asked for, or null "
+        "if they did not ask to change the trip length"
     )
 
 
@@ -148,7 +187,10 @@ class TripState(TypedDict, total=False):
     feedback_round: int   # how many times the user has asked for changes
     approved: bool        # the user accepted the plan
     new_request: str      # the user asked for a completely different trip
+    answer_to_question: str  # reply to the user's question, shown at the next review
     message: str          # final message for the user
+    # Decisions made by SemIf (or by the fallback), shown in the UI.
+    decision_log: Annotated[list[dict], operator.add]
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +244,8 @@ tool_node = ToolNode(TOOLS)
 # ---------------------------------------------------------------------------
 PARSE_PROMPT = """You extract trip details from a travel request.
 Only fill in what the user actually said. Use null for anything not stated.
+If the request ends with an update from the traveler, the update overrides
+anything earlier that it conflicts with.
 Keep destination names in English."""
 
 
@@ -308,6 +352,8 @@ Rules:
 - If the trip covers several cities or countries, include travel days and
   keep the order of destinations sensible.
 - Prefer real places that appear in the research notes.
+- Name each stop by its official name, as it appears on a map, so it can be
+  found on the map. Put any description in the note, not in the name.
 - Match the user's interests and budget.
 - Tips should be practical (getting around, money, seasonal weather, etiquette).
   Do not state visa or entry requirements as facts; tell the traveler to check
@@ -436,6 +482,20 @@ def safe_lookup(query: str, country_code: str, errors: list[str]) -> Optional[di
         return None
 
 
+DESCRIPTIVE_PREFIX = re.compile(
+    r"^(the\s+)?(historic(al)?\s+(center|centre|district|quarter)|old\s+town|"
+    r"downtown|city\s+cent(er|re)|ruins|streets|markets?)\s+(of|in)\s+",
+    re.IGNORECASE,
+)
+
+
+def simplify_place_name(name: str) -> str:
+    """Drop text in parentheses and a leading description, so a vague stop name
+    can still be found: 'Historic Center of Antigua (UNESCO site)' -> 'Antigua'."""
+    short = re.sub(r"\s*\([^)]*\)", "", name).strip()
+    return DESCRIPTIVE_PREFIX.sub("", short).strip() or name
+
+
 def geocode_stops(state: TripState) -> TripState:
     """Add lat/lon to every day (its city) and every stop of the itinerary."""
     write = get_stream_writer()  # sends custom progress events to the UI
@@ -460,9 +520,14 @@ def geocode_stops(state: TripState) -> TripState:
 
         for stop in day["stops"]:
             # 1st try: "Stop, City"   2nd try: "Stop" restricted to the city's country
+            # 3rd try: the name without descriptive words, e.g. "Historic Center
+            # of Guatemala City" -> "Guatemala City" (only if that changes it)
             hit = safe_lookup(f"{stop['name']}, {day['city']}", "", errors)
             if hit is None and city and city["country_code"]:
                 hit = safe_lookup(stop["name"], city["country_code"], errors)
+                short = simplify_place_name(stop["name"])
+                if hit is None and short != stop["name"]:
+                    hit = safe_lookup(short, city["country_code"], errors)
             found_any = found_any or hit is not None
             # Sanity check: reject matches that are implausibly far from the city
             if hit and city and haversine_km(
@@ -490,10 +555,48 @@ def geocode_stops(state: TripState) -> TripState:
 
 
 # ---------------------------------------------------------------------------
-# Plan check (plain Python, no LLM)
+# Decision model helpers (SemIf, see decisions.py)
 # ---------------------------------------------------------------------------
+def log_decision(node: str, question_text: str, d: Optional[Decision], outcome: str) -> dict:
+    """One entry of the decision log shown in the UI."""
+    return {
+        "node": node,
+        "question": question_text,
+        "choice": d.choice if d else None,
+        "confidence": d.confidence if d else None,
+        "probabilities": d.probabilities if d else {},
+        "seconds": d.seconds if d else None,
+        "outcome": outcome,
+    }
+
+
+def semif_unavailable() -> str:
+    return "SemIf not available" + (f" ({semif.last_error})" if semif.last_error else "")
+
+
+# ---------------------------------------------------------------------------
+# Plan check (plain Python rules + semantic checks by the decision model)
+# ---------------------------------------------------------------------------
+def unmatched_destinations(trip: dict, itinerary: dict) -> list[str]:
+    """Destinations whose name appears in no city or stop name (text match)."""
+    days = itinerary["day_plans"]
+    text = " ".join(
+        [d["city"] for d in days] + [s["name"] for d in days for s in d["stops"]]
+    ).lower()
+    return [dest for dest in trip["destinations"] if dest.lower() not in text]
+
+
+def destination_issue(dest: str) -> str:
+    return f"'{dest}' is one of the requested destinations but no day visits it."
+
+
 def check_itinerary(trip: dict, itinerary: dict) -> list[str]:
-    """Return a list of problems with the itinerary (empty list = looks fine)."""
+    """Rules in plain Python. Return a list of problems (empty list = looks fine).
+
+    Rule 2 (every destination is visited) and rule 7 (interests are covered)
+    need some understanding of place names and activities, so they live in
+    semantic_checks() below.
+    """
     issues = []
     days = itinerary["day_plans"]
 
@@ -501,14 +604,6 @@ def check_itinerary(trip: dict, itinerary: dict) -> list[str]:
     expected = min(trip["days"], MAX_DAYS)
     if len(days) != expected:
         issues.append(f"The plan has {len(days)} days but the trip is {expected} days.")
-
-    # 2. Every destination appears somewhere (city or stop name)
-    text = " ".join(
-        [d["city"] for d in days] + [s["name"] for d in days for s in d["stops"]]
-    ).lower()
-    for dest in trip["destinations"]:
-        if dest.lower() not in text:
-            issues.append(f"'{dest}' is one of the requested destinations but no day visits it.")
 
     seen: dict[str, int] = {}
     prev = None
@@ -555,18 +650,97 @@ def check_itinerary(trip: dict, itinerary: dict) -> list[str]:
     return issues
 
 
+def itinerary_as_text(itinerary: dict) -> str:
+    """The plan as compact text: the state SemIf reads for the semantic checks."""
+    lines = []
+    for d in itinerary["day_plans"]:
+        stops = "; ".join(f"{s['name']} ({s['note']})" for s in d["stops"])
+        lines.append(f"Day {d['day']}, based in {d['city']}: {stops}")
+    return "\n".join(lines)
+
+
+def semantic_checks(trip: dict, itinerary: dict) -> tuple[list[str], list[dict]]:
+    """Rules 2 and 7, answered by SemIf in one request (shared state).
+
+    2. Every destination is visited. The text match runs first; only names it
+       can't find (e.g. 'Kyoto' when the day is based in 'Arashiyama, Japan')
+       go to SemIf, and they pass only if SemIf is confident they are visited.
+    7. Every interest is covered by at least one stop. This fails only if SemIf
+       is confident it is NOT covered, because a failed check makes the LLM
+       rewrite the plan.
+    Without SemIf, rule 2 falls back to the text match and rule 7 is skipped.
+    """
+    unmatched = unmatched_destinations(trip, itinerary)
+    interests = trip["interests"][:MAX_INTEREST_CHECKS]
+    questions, labels = [], {}
+    for i, dest in enumerate(unmatched):
+        text = f"Does this itinerary spend time in {dest}?"
+        questions.append(question(f"dest{i}", text, {
+            "yes": f"At least one day is based in {dest} or visits places in {dest}.",
+            "no": f"No day of the itinerary is in {dest}.",
+        }))
+        labels[f"dest{i}"] = (dest, text)
+    for i, interest in enumerate(interests):
+        text = f"Does at least one stop suit a traveler interested in '{interest}'?"
+        questions.append(question(f"interest{i}", text, {
+            "yes": f"At least one stop is a good match for the interest '{interest}'.",
+            "no": f"None of the stops matches the interest '{interest}'.",
+        }))
+        labels[f"interest{i}"] = (interest, text)
+    if not questions:
+        return [], []
+
+    answers = semif.decide(itinerary_as_text(itinerary), questions)
+    if answers is None:
+        log = [log_decision("validate_itinerary", "Semantic plan checks", None,
+                            f"{semif_unavailable()}: used the text rule only")]
+        return [destination_issue(dest) for dest in unmatched], log
+
+    issues, log = [], []
+    for qid, d in answers.items():
+        subject, text = labels[qid]
+        if qid.startswith("dest"):
+            if d.choice == "yes" and d.confidence >= CHECK_CONFIDENCE:
+                outcome = f"counts as visiting {subject}"
+            else:
+                issues.append(destination_issue(subject))
+                outcome = "not confident it is visited: flagged"
+        else:
+            if d.choice == "no" and d.confidence >= CHECK_CONFIDENCE:
+                issues.append(
+                    f"No stop matches the interest '{subject}'; include at least one "
+                    "stop for it."
+                )
+                outcome = "interest not covered: flagged"
+            else:
+                outcome = "passed"
+        log.append(log_decision("validate_itinerary", text, d, outcome))
+    return issues, log
+
+
 def validate_itinerary(state: TripState) -> TripState:
     """Run the rule checks and record the result."""
     issues = check_itinerary(state["trip"], state["itinerary"])
+    semantic_issues, log = semantic_checks(state["trip"], state["itinerary"])
+    issues = semantic_issues + issues
     entry = {"round": state.get("revision_count", 0), "issues": issues}
-    return {"issues": issues, "check_log": (state.get("check_log") or []) + [entry]}
+    return {"issues": issues, "check_log": (state.get("check_log") or []) + [entry],
+            "decision_log": log}
 
 
 def route_after_validate(state: TripState) -> str:
     """Conditional edge: revise the plan, or finish."""
     if state["issues"] and state.get("revision_count", 0) < MAX_REVISIONS:
+        if revision_stuck(state):
+            return "review"  # revising again would most likely change nothing
         return "draft_itinerary"
     return "review"
+
+
+def revision_stuck(state: TripState) -> bool:
+    """True if the last revision left exactly the same problems as before it."""
+    log = state.get("check_log") or []
+    return len(log) >= 2 and log[-1]["issues"] == log[-2]["issues"]
 
 
 # ---------------------------------------------------------------------------
@@ -578,11 +752,51 @@ Changes they asked for earlier: {earlier}
 
 Their reply: "{answer}"
 
-Decide what they want."""
+Decide what they want. If the reply adds or removes a destination, or reads
+like a complete new trip request rather than feedback on this plan, the
+action is 'new_trip', even if it keeps some of the current destinations;
+then write the complete new request in 'instructions'. If the reply is only
+a question (about weather, costs, visas, a place...) and asks for no change,
+the action is 'question'. A change request phrased as a question
+("Can you make day 2 calmer?") is still 'change'."""
+
+ANSWER_PROMPT = """You are a travel assistant. The traveler is looking at the
+itinerary below and asked a question. Answer it in 2-4 sentences.
+
+Use the research notes when they cover the question, and say so when they
+don't (then give general guidance and suggest where to check). Do not state
+visa or entry requirements as facts; tell the traveler to check official
+government sources. Do not change the itinerary.
+
+Trip: {destinations}, {days} days, {season}
+Itinerary:
+{itinerary}
+
+Research notes:
+{notes}
+
+Question: "{question}\""""
+
+
+def answer_question(state: TripState, question_text: str) -> str:
+    """Answer a question about the trip (LLM), without touching the plan."""
+    trip = state["trip"]
+    response = get_llm().invoke(ANSWER_PROMPT.format(
+        destinations=", ".join(trip["destinations"]),
+        days=trip["days"],
+        season=trip["season"] or "season not specified",
+        itinerary=itinerary_for_prompt(state["itinerary"]),
+        notes=state.get("research_notes") or "(no research notes)",
+        question=question_text,
+    ))
+    return response.content
 
 
 def review_message(state: TripState) -> str:
     """What we tell the user when we show them the (updated) plan."""
+    if state.get("answer_to_question"):  # we just answered a question
+        return (f"{state['answer_to_question']}\n\nAnything else? Tell me what to "
+                "change in the itinerary, ask another question, or say it looks good.")
     trip = state["trip"]
     if state.get("feedback_round"):
         message = "I've updated your itinerary."
@@ -594,6 +808,8 @@ def review_message(state: TripState) -> str:
         message += f" The automatic plan check made me revise it {times}."
     if state.get("issues"):
         message += " A few problems are still left; see the plan check below."
+        if revision_stuck(state) and revisions < MAX_REVISIONS:
+            message += " Revising didn't fix them, so I stopped early."
     if trip["days"] > MAX_DAYS:
         message += f" (I planned the first {MAX_DAYS} days to keep it manageable.)"
     message += (
@@ -603,35 +819,113 @@ def review_message(state: TripState) -> str:
     return message
 
 
+LENGTH_PROMPT = """The current trip is {days} days long. The traveler replied:
+"{answer}"
+
+If they asked for a different trip length, give the new total number of days
+(for example, "two more days" on a 5-day trip means 7). Otherwise return null."""
+
+
+def new_days_from_llm(days: int, answer: str) -> Optional[int]:
+    result = get_llm().with_structured_output(LengthChange).invoke(
+        LENGTH_PROMPT.format(days=days, answer=answer)
+    )
+    return result.new_days
+
+
+def route_with_semif(state: TripState, answer: str, log: list[dict]):
+    """Classify the reply with SemIf. Returns (action, new_days, instructions),
+    or None when SemIf is unavailable or not confident enough."""
+    trip = state["trip"]
+    # Both questions share one state, so SemIf answers them in one request.
+    answers = semif.decide(
+        semif.review_state(trip["destinations"], trip["days"],
+                           state.get("user_feedback") or [], answer),
+        semif.review_questions(),
+    )
+    if answers is None:
+        log.append(log_decision("review", ACTION_QUESTION, None,
+                                f"{semif_unavailable()}: the LLM decided"))
+        return None
+    action = answers["action"]
+    if action.confidence < ROUTE_CONFIDENCE:
+        log.append(log_decision(
+            "review", ACTION_QUESTION, action,
+            f"not confident ({action.confidence:.2f} < {ROUTE_CONFIDENCE}): the LLM decided",
+        ))
+        return None
+    log.append(log_decision("review", ACTION_QUESTION, action, f"used: {action.choice}"))
+
+    if action.choice == "approve":
+        return "approve", None, ""
+    if action.choice == "question":
+        return "question", None, answer
+    if action.choice == "new_trip":
+        # parse_request (an LLM step) reads the whole text in the new thread,
+        # so the update can refer to the old request ("same dates, but Peru").
+        request = (f"{state['request']}\n\nUpdate from the traveler (it overrides "
+                   f"anything above that it conflicts with): {answer}")
+        return "new_trip", None, request
+
+    # A change. Reading a number out of the reply needs the LLM, so ask it only
+    # when SemIf isn't sure that the trip length stays the same.
+    length = answers["length"]
+    if length.choice == "no" and length.confidence >= ROUTE_CONFIDENCE:
+        log.append(log_decision("review", LENGTH_QUESTION, length,
+                                "used: keep the trip length (no LLM call)"))
+        return "change", None, answer
+    new_days = new_days_from_llm(trip["days"], answer)
+    log.append(log_decision(
+        "review", LENGTH_QUESTION, length,
+        f"asked the LLM for the new length: {new_days or 'unchanged'}",
+    ))
+    return "change", new_days, answer
+
+
 def review(state: TripState) -> TripState:
-    """Show the plan, wait for the user's reply, and decide what to do next."""
+    """Show the plan, wait for the user's reply, and decide what to do next.
+
+    SemIf classifies the reply first; the LLM is the fallback.
+    """
     answer = interrupt(review_message(state))
 
     trip = state["trip"]
-    decision = get_llm().with_structured_output(FeedbackDecision).invoke(
-        REVIEW_PROMPT.format(
-            destinations=", ".join(trip["destinations"]),
-            days=trip["days"],
-            earlier="; ".join(state.get("user_feedback") or []) or "none",
-            answer=answer,
+    log: list[dict] = []
+    routed = route_with_semif(state, answer, log)
+    if routed is None:  # Step 5 behaviour: the LLM classifies the reply
+        decision = get_llm().with_structured_output(FeedbackDecision).invoke(
+            REVIEW_PROMPT.format(
+                destinations=", ".join(trip["destinations"]),
+                days=trip["days"],
+                earlier="; ".join(state.get("user_feedback") or []) or "none",
+                answer=answer,
+            )
         )
-    )
-    if decision.action == "approve":
-        return {
+        log[-1]["outcome"] += f": {decision.action}"
+        routed = decision.action, decision.new_days, decision.instructions
+    action, new_days, instructions = routed
+
+    # answer_to_question is cleared on every path except 'question' itself
+    update: TripState = {"decision_log": log, "answer_to_question": ""}
+    if action == "approve":
+        return update | {
             "approved": True,
             "message": "Great, your itinerary is final. Have a wonderful trip! ✈️  "
                        "Send a new request any time to plan another one.",
         }
-    if decision.action == "new_trip":
-        return {"new_request": decision.instructions or answer}
+    if action == "new_trip":
+        return update | {"new_request": instructions or answer}
+    if action == "question":
+        # Answer it and come back to this node (route_after_review), so the
+        # plan stays as it is and we wait for the next reply.
+        return update | {"answer_to_question": answer_question(state, answer)}
     # A change request: start a fresh round of drafting and plan checks
-    update: TripState = {}
-    if decision.new_days and decision.new_days != trip["days"]:
+    if new_days and new_days != trip["days"]:
         # Update the trip itself, so the planner and the plan check both use the
         # new length (otherwise the check would flag the shorter plan as wrong).
-        update["trip"] = {**trip, "days": decision.new_days}
+        update["trip"] = {**trip, "days": new_days}
     return update | {
-        "user_feedback": (state.get("user_feedback") or []) + [decision.instructions or answer],
+        "user_feedback": (state.get("user_feedback") or []) + [instructions or answer],
         "feedback_round": state.get("feedback_round", 0) + 1,
         "issues": [],
         "revision_count": 0,
@@ -642,6 +936,8 @@ def review(state: TripState) -> TripState:
 def route_after_review(state: TripState) -> str:
     if state.get("approved") or state.get("new_request"):
         return END
+    if state.get("answer_to_question"):
+        return "review"  # show the answer and wait for the next reply
     return "draft_itinerary"
 
 
@@ -674,14 +970,30 @@ def build_graph():
     graph.add_conditional_edges(
         "validate_itinerary", route_after_validate, ["draft_itinerary", "review"]
     )
-    graph.add_conditional_edges("review", route_after_review, ["draft_itinerary", END])
+    graph.add_conditional_edges("review", route_after_review,
+                                ["draft_itinerary", "review", END])
     # The checkpointer saves the state after every step, per thread_id.
     # That is what lets interrupt() pause the graph and resume it later.
     return graph.compile(checkpointer=InMemorySaver())
 
 
+def format_decision(entry: dict) -> str:
+    """One decision-log entry as a line of markdown."""
+    if entry["choice"] is None:
+        return f"🧠 {entry['question']}: {entry['outcome']}"
+    return (f"🧠 *{entry['question']}* → **{entry['choice']}** "
+            f"({entry['confidence']:.2f}, {entry['seconds']:.1f} s): {entry['outcome']}")
+
+
 def describe_step(node: str, output: dict) -> list[str]:
     """Human-readable progress lines for one node update."""
+    # Checks that simply passed are left to the Decisions expander.
+    decision_lines = [format_decision(e) for e in output.get("decision_log") or []
+                      if e["outcome"] != "passed"]
+    return decision_lines + describe_node(node, output)
+
+
+def describe_node(node: str, output: dict) -> list[str]:
     if node == "parse_request":
         return ["✅ Understood your request"]
     if node == "ask_for_details":
@@ -708,6 +1020,8 @@ def describe_step(node: str, output: dict) -> list[str]:
             return ["👍 Plan approved"]
         if output.get("new_request"):
             return ["🆕 Starting a new trip"]
+        if output.get("answer_to_question"):
+            return ["💬 Answered your question (the itinerary is unchanged)"]
         lines = [f"✏️ Applying your changes: *{output['user_feedback'][-1]}*"]
         if "trip" in output:
             lines.insert(0, f"📅 Changed the trip length to {output['trip']['days']} days")
@@ -848,14 +1162,30 @@ def run_graph(graph_input) -> str:
     return reply
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def semif_status() -> Optional[dict]:
+    """Is the SemIf server up? Cached briefly so each rerun doesn't ask again."""
+    return semif.health()
+
+
 with st.sidebar:
     st.header("About")
     st.write(
         "A LangGraph agent that reads your travel request, asks for anything "
         "missing, researches the destinations on Wikipedia, drafts a "
         "day-by-day itinerary, puts it on a map, checks the plan with simple "
-        "rules, and then revises it with you until you're happy."
+        "rules, and then revises it with you until you're happy. Small "
+        "decisions are made by SemIf, a local decision model."
     )
+    semif_info = semif_status()
+    if semif_info:
+        st.success(f"🧠 SemIf connected: `{semif_info.get('gguf') or semif_info.get('model')}`")
+    else:
+        st.info(
+            f"🧠 SemIf isn't running at `{semif.SEMIF_URL}`, so the LLM and the text "
+            "rules make every decision. Start `semif_server.py` to use the decision "
+            "model (see README)."
+        )
     if not CONTACT_EMAIL:
         st.warning(
             "Add `CONTACT_EMAIL=you@example.com` to your `.env` file. Wikipedia and "
@@ -981,8 +1311,24 @@ if values.get("itinerary") and not values.get("new_request"):
             st.caption(
                 f"Rules: ≤{MAX_STOPS_PER_DAY} stops/day, ≤{MAX_DAY_ROUTE_KM} km between a "
                 f"day's stops, ≤{MAX_STOPS_ON_TRANSFER_DAY} stops on days that move "
-                f">{TRANSFER_KM} km, no repeated places, every destination visited."
+                f">{TRANSFER_KM} km, no repeated places, every destination visited, "
+                f"every interest covered (checked by SemIf, confidence ≥ {CHECK_CONFIDENCE})."
             )
+
+    if values.get("decision_log"):
+        log = values["decision_log"]
+        with st.expander(f"🧠 Decisions ({len(log)})"):
+            st.caption(
+                "Small decisions made by the SemIf decision model, with the probability "
+                f"of each option. The review router trusts SemIf at ≥ {ROUTE_CONFIDENCE}; "
+                "below that, the LLM decides."
+            )
+            for entry in log:
+                st.markdown(f"`{entry['node']}` {format_decision(entry)}")
+                if entry["probabilities"]:
+                    st.caption(" · ".join(
+                        f"{option} {p:.2f}" for option, p in entry["probabilities"].items()
+                    ))
 
     if values.get("unlocated"):
         with st.expander(f"❔ Not found on the map ({len(values['unlocated'])})"):
