@@ -160,7 +160,7 @@ SEMIF_TIMEOUT=60
 `semif_server.py` keeps the SemIf model loaded and answers the app over HTTP. It runs in the SemIf environment from Lecture 7, not in this project's environment, because it needs `llama-cpp-python`, `transformers` and a 3 GB model file. On Windows, run it **inside WSL2**. The Streamlit app can stay in PowerShell: WSL2 forwards `localhost`.
 
 ```bash
-# One-time setup (inside WSL), as in the Lecture 7 slides
+# One-time setup (inside WSL)
 git clone https://github.com/TheoLeeCJ/SemIf-OpenJev && cd SemIf-OpenJev
 git checkout 23cf1f39fc9534fe81437200959b6dfc7106e45a
 python3 -m venv .venv && . .venv/bin/activate
