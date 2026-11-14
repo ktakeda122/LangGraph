@@ -1,6 +1,6 @@
 # ✈️ Trip Planner Agent
 
-A travel-planning agent built with **LangGraph** and **Streamlit**. Small decisions are made by **SemIf**, a local *decision model* .
+A travel-planning agent built with **LangGraph** and **Streamlit**. It uses two kinds of routing: small decisions about *where the graph goes next* are made by **SemIf**, a local *decision model*, and every LLM call is sent to **OpenRouter's Auto Router**, which picks *which model* answers it.
 
 🔗 **Source code:** https://github.com/ktakeda122/LangGraph
 
@@ -26,6 +26,7 @@ You describe a trip in plain English, for example *"7 days in Guatemala, El Salv
 | 📍 **Map** | Every stop is geocoded with OpenStreetMap and drawn on a pydeck map: one color per day, with stops connected in visiting order. You can filter the map by day, and a **Simple map** toggle (`st.map`) is available as a fallback. |
 | 🧪 **Plan check** | Rule checks in plain Python, plus two semantic checks answered by the decision model (see [below](#plan-check-rules)). If a check fails, the plan goes back to the planner with the list of problems, up to 2 times. It stops early if a revision leaves exactly the same problems. |
 | 🧠 **Decision model** | SemIf classifies your reply to each plan and runs the semantic plan checks. It returns a probability for each option, so the app trusts it only when it is confident and asks the LLM otherwise (see [Decision model](#decision-model-semif)). Every decision is listed in a **Decisions** panel with its probabilities. |
+| 🧭 **Model router** | With an OpenRouter key, each LLM call goes to OpenRouter's Auto Router, which chooses a model for that request: a small one to read a sentence, a stronger one to write a plan (see [Model router](#model-router-openrouter-auto-router)). A **Models** panel lists every call with its model, the router's tier and effort, tokens and cost. Without the key, every call uses gpt-4.1-mini. |
 | ✏️ **Human in the loop** | After each plan, the agent waits for your reply. *"Make day 2 more relaxed"* revises the plan, *"make it 6 days"* changes the trip length, *"looks good"* finishes, *"plan 5 days in Japan instead"* starts a new trip, and a question such as *"what's the weather like in December?"* gets an answer while the plan stays as it is. |
 | 📡 **Live progress** | Each step of the graph appears as it runs, including a progress bar while places are being located. |
 
@@ -66,6 +67,8 @@ Solid arrows are normal edges and dotted arrows are conditional edges. The app's
 | `validate_itinerary` | 🧠 SemIf | Runs the [plan-check rules](#plan-check-rules). The two semantic rules go to SemIf in one request. |
 | `review` | 🧠 SemIf, LLM only if needed | Calls `interrupt()` to show the plan and wait for your reply. SemIf then classifies the reply as approve, change, new trip or question, and says whether it changes the trip length. The LLM is called only when SemIf is unsure, to read the new number of days (`LengthChange`), or to answer a question. After an answer, the node runs again and waits for the next reply. Without SemIf, the LLM classifies the reply as in Step 5 (`FeedbackDecision`). |
 
+Every "LLM" above goes through `call_llm()` in `llm_router.py`: OpenRouter's Auto Router when `OPENROUTER_API_KEY` is set, gpt-4.1-mini otherwise.
+
 ### LangGraph features used
 
 - **`StateGraph` with a typed state** (`TripState`). Reducers handle list fields: `add_messages` for the research conversation and `operator.add` for sources.
@@ -93,11 +96,44 @@ Many steps of this agent are really multiple-choice questions, and a chat LLM is
 Design choices:
 
 - **The LLM writes, SemIf decides.** Text, itineraries and numbers still come from the LLM. SemIf can't answer outside its options, but it can still pick the wrong one.
-- **Probabilities set the route, not just the choice.** Each threshold matches the cost of a mistake. A wrong route can be corrected in the next message, so the router accepts 0.90. A failed check makes the LLM rewrite the plan, so a check fails only at ≥ 0.80.
+- **Probabilities set the route, not just the choice.** Each threshold matches the cost of a mistake. The review step uses 0.90, chosen with `eval_router.py`: compared with 0.80, it stopped one confident mistake and sent only two more of 37 replies to the LLM. A failed check makes the LLM rewrite the plan, so a check fails only at ≥ 0.80.
 - **Questions about one state go in one request.** The two review questions share one state, and so do all the plan checks. The server scores them in SemIf's *shared* mode, which reads the state once.
 - **Everything still works without SemIf.** If the server isn't running, the router uses the LLM and the plan check uses the text rule, exactly as in Step 5. The sidebar shows whether SemIf is connected.
 - **Every question gets an option that means "none of these".** A decision model must pick one of its options, so a reply that fits none of them still gets a confident answer. When the router only had `approve`, `change` and `new_trip`, SemIf labeled questions such as "Do I need a visa for Japan?" as `new_trip` with confidence 0.75–0.83, which would have restarted the trip. The `question` option gives those replies somewhere correct to go. Raising the threshold could not fix this, because the LLM fallback had the same three options.
 - **Thresholds are tuned, not guessed.** SemIf's probabilities are not calibrated out of the box. `eval_router.py` runs labeled replies in three groups (easy, hard, questions). For each threshold, it shows how many decisions SemIf would make, how accurate they would be, and how many mistakes would be acted on.
+
+---
+
+## Model router (OpenRouter Auto Router)
+
+The agent makes very different LLM calls: reading one sentence into a `TripRequest`, running a tool-calling research loop, writing a multi-day itinerary, answering a question. A single fixed model is either too weak for the hard ones or too expensive for the easy ones. With `OPENROUTER_API_KEY` set, every call goes to `openrouter/auto`, and OpenRouter's Auto Router picks a model for that request.
+
+| Step | Purpose in the log | Router session |
+|---|---|---|
+| `parse_request` | Read the request | `<trip>-parse_request` |
+| `research_agent` | Research / Write research notes | `<trip>-research_agent` |
+| `draft_itinerary` | Draft / Revise the itinerary | `<trip>-draft_itinerary` |
+| `review` | Read the new trip length, Classify the reply (only when SemIf can't decide) | `<trip>-review` |
+| `review` (question) | Answer a question | `<trip>-answer_question` |
+
+How it is set up (`llm_router.py`):
+
+- **Settings follow the course demo (`autoroute_demo.py`).** The model is `openrouter/auto`, and its settings go in a plugin whose id is `auto-router`; settings under any other id are silently ignored. `X-OpenRouter-Metadata: enabled` returns the router's candidates and reason, and `usage: {include: true}` returns each request's cost.
+- **One router session per trip and node.** The Auto Router keeps a session on one model unless the task changes. A session per node keeps the research loop on one model (and its prompt cache), while each step is still routed on its own. The demo uses a fresh session per request instead, because it compares unrelated prompts.
+- **Structured output by function calling.** OpenRouter documents tool calling for every routed model, but not `json_schema` structured outputs, so `with_structured_output` uses `method="function_calling"`.
+- **A fallback model.** If a routed call fails (an API error, or a structured output that doesn't parse), it is retried once on gpt-4.1-mini when `OPENAI_API_KEY` is set. The Models panel marks those calls with ⚠️.
+- **Everything is logged.** Each call adds an entry to `llm_log` in the graph state: purpose, served model, the router's tier and effort, its candidates and reason, tokens, cost and time. The progress panel shows one 🧭 line per call, and the **Models** panel shows the whole trip with its total cost.
+
+Optional settings in `.env`:
+
+| Setting | Effect |
+|---|---|
+| `OPENROUTER_COST_TIER` | `low`, `medium` or `high`. Leave it unset to use the router's default policy. |
+| `OPENROUTER_ALLOWED_MODELS` | Comma-separated patterns, e.g. `anthropic/*,openai/*,google/*`. Only these models can be chosen. |
+| `OPENROUTER_EXCLUDED_MODELS` | Same syntax; these models are never chosen. |
+| `USE_OPENROUTER=0` | Ignore the OpenRouter key and use gpt-4.1-mini for every call, to compare with the router. |
+
+**Comparing with a fixed model.** Plan the same trip twice: once with the router, and once with `USE_OPENROUTER=0`. Restart Streamlit between the runs. Then compare the Models panels: which models were used for which steps, the tokens, the time and (for the router) the cost.
 
 ---
 
@@ -122,7 +158,7 @@ The limits are constants at the top of `trip_planner.py` (`MAX_STOPS_PER_DAY`, `
 
 ## Setup
 
-Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/), and an OpenAI API key.
+Requirements: Python 3.10+, [uv](https://docs.astral.sh/uv/), and an OpenAI API key and/or an OpenRouter API key.
 
 ```powershell
 # 1. Install the dependencies (creates .venv from pyproject.toml / uv.lock)
@@ -145,13 +181,18 @@ uv add streamlit langgraph langchain-openai langchain-core python-dotenv wikiped
 
 ```
 OPENAI_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
 CONTACT_EMAIL=you@example.com
 # optional
 SEMIF_URL=http://127.0.0.1:8765
 SEMIF_TIMEOUT=60
+# OPENROUTER_COST_TIER=low
+# OPENROUTER_ALLOWED_MODELS=anthropic/*,openai/*,google/*
+# USE_OPENROUTER=0      # uncomment to compare with gpt-4.1-mini
 ```
 
-- `OPENAI_API_KEY`: used for `gpt-4.1-mini`. `OPENAI_API_TOKEN` also works.
+- `OPENAI_API_KEY`: used for `gpt-4.1-mini`, and as the fallback when a routed call fails. `OPENAI_API_TOKEN` also works.
+- `OPENROUTER_API_KEY`: turns on the Auto Router for every LLM call. The other `OPENROUTER_*` settings and `USE_OPENROUTER` are described in [Model router](#model-router-openrouter-auto-router).
 - `CONTACT_EMAIL`: added to the User-Agent sent to Wikipedia and OpenStreetMap. Both services ask clients to identify themselves and may block or rate-limit requests that don't. If it is missing, the app shows a warning in the sidebar.
 - `SEMIF_URL` / `SEMIF_TIMEOUT`: where the SemIf server runs, and how many seconds to wait for one request before falling back to the LLM.
 
@@ -188,8 +229,8 @@ Never commit `.env`: add it to `.gitignore`.
 1. Type a request, for example:
    - `7 days in Tokyo and Kyoto in December, food and temples, mid budget`
    - `A trip to Guatemala and Honduras` (the agent will ask how many days)
-2. Watch the progress panel as the agent researches, drafts, locates places and checks the plan.
-3. Explore the result: the map (filter by day), the day tabs, travel tips, the plan-check results, the decisions SemIf made (with probabilities), the research notes and the Wikipedia sources.
+2. Watch the progress panel as the agent researches, drafts, locates places and checks the plan. Each 🧭 line shows which model the router chose for that call.
+3. Explore the result: the map (filter by day), the day tabs, travel tips, the plan-check results, the decisions SemIf made (with probabilities), the models the router chose (with tokens and cost), the research notes and the Wikipedia sources.
 4. Reply in the chat:
    - `Day 2 is too busy, make it calmer` → revised plan
    - `Make it a 6 day trip` → trip length updated and plan redrafted
@@ -215,6 +256,8 @@ Never commit `.env`: add it to `.gitignore`.
 - Without SemIf, the destination rule only compares text, so a day based in "Arashiyama, Japan" does not count as visiting "Kyoto". With SemIf, such cases are checked by the model.
 - SemIf is a 4B model and it can be wrong. Its probabilities are not calibrated as-is, which is why it decides only above a threshold and the LLM handles the rest. The thresholds are a starting point: tune them with `eval_router.py`.
 - SemIf runs on the CPU. A request can take several seconds, depending on the machine and the length of the state. The plan checks read the whole itinerary, so they are the slowest. If requests time out, raise `SEMIF_TIMEOUT`.
+- With the router, the model behind each step can change from run to run, so the same request can give different plans and costs. The cost comes from OpenRouter's usage report; gpt-4.1-mini calls show tokens only.
+- A routed model may handle forced tool calls (used for structured output) worse than gpt-4.1-mini. Such calls fail over to gpt-4.1-mini; without an OpenAI key, they fail. `OPENROUTER_ALLOWED_MODELS` can limit the router to model families you trust.
 - Distances are straight lines, not road or rail distances.
 
 ## Files
@@ -222,6 +265,7 @@ Never commit `.env`: add it to `.gitignore`.
 ```
 Trip/
 ├── trip_planner.py   # the app: graph, nodes, tools and Streamlit UI
+├── llm_router.py     # every LLM call: OpenRouter Auto Router, or gpt-4.1-mini
 ├── decisions.py      # client for the SemIf server + the review questions
 ├── semif_server.py   # SemIf decision server (runs in the SemIf environment)
 ├── eval_router.py    # labeled replies: accuracy and coverage per threshold
@@ -233,4 +277,4 @@ Trip/
 
 ## Credits
 
-Built with [LangGraph](https://langchain-ai.github.io/langgraph/), [LangChain](https://python.langchain.com/), [Streamlit](https://streamlit.io/), [pydeck](https://deckgl.readthedocs.io/) and [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) (Qwen3.5-4B). Data from [Wikipedia](https://www.wikipedia.org/) and [OpenStreetMap](https://www.openstreetmap.org/copyright) (© OpenStreetMap contributors, via Nominatim).
+Built with [LangGraph](https://langchain-ai.github.io/langgraph/), [LangChain](https://python.langchain.com/), [Streamlit](https://streamlit.io/), [pydeck](https://deckgl.readthedocs.io/), [SemIf](https://github.com/TheoLeeCJ/SemIf-OpenJev) (Qwen3.5-4B) and [OpenRouter](https://openrouter.ai/docs/guides/routing/routers/auto-router)'s Auto Router. Data from [Wikipedia](https://www.wikipedia.org/) and [OpenStreetMap](https://www.openstreetmap.org/copyright) (© OpenStreetMap contributors, via Nominatim).

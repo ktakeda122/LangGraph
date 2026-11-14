@@ -1,5 +1,5 @@
-"""Trip Planner Agent - Step 6 (HW 7-2: decision model)
-LangGraph + Streamlit + SemIf
+"""Trip Planner Agent - Step 7 (HW 7-2: decision model + router)
+LangGraph + Streamlit + SemIf + OpenRouter Auto Router
 
 Graph:
     START -> parse_request --(missing info)--> ask_for_details  [interrupt]
@@ -31,6 +31,12 @@ of text (see decisions.py and semif_server.py):
 If the SemIf server isn't running, every decision falls back to the LLM or to
 the plain-text rules, as in Step 5.
 
+Router (HW 7-2): with OPENROUTER_API_KEY set, every LLM call goes to
+OpenRouter's Auto Router, which picks a model per request (see llm_router.py).
+Related calls share a session id per trip and node, so the research loop stays
+on one model while other steps are routed on their own. Without the key, the
+app uses gpt-4.1-mini on OpenAI, as in Step 6.
+
 Run with:
     uv run streamlit run trip_planner.py
 (and, optionally, semif_server.py in the SemIf environment; see README)
@@ -52,9 +58,8 @@ import wikipedia
 from dotenv import load_dotenv
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.config import get_stream_writer
+from langgraph.config import get_config, get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -66,7 +71,9 @@ load_dotenv()
 # decisions reads SEMIF_URL / SEMIF_TIMEOUT from the environment, so import it
 # after load_dotenv() to pick up values from .env too.
 import decisions as semif  # noqa: E402
+import llm_router  # noqa: E402
 from decisions import ACTION_QUESTION, LENGTH_QUESTION, Decision, question  # noqa: E402
+from llm_router import call_llm  # noqa: E402
 
 MAX_DAYS = 14             # keep the drafted itinerary a manageable size
 MAX_RESEARCH_ROUNDS = 4   # max rounds of tool calls before the agent must stop
@@ -81,7 +88,7 @@ MAX_STOPS_ON_TRANSFER_DAY = 2  # ...which should be light
 
 # Decision model (SemIf). Its probabilities are not calibrated out of the box,
 # so these thresholds should be tuned on your own examples (eval_router.py).
-ROUTE_CONFIDENCE = 0.90   # below this, the review router asks the LLM instead
+ROUTE_CONFIDENCE = 0.90   # below this, the review router asks the LLM instead (set from eval_router.py)
 CHECK_CONFIDENCE = 0.80   # a semantic plan check changes the result only above this
 MAX_INTEREST_CHECKS = 5   # interests checked per plan (one SemIf question each)
 
@@ -191,20 +198,25 @@ class TripState(TypedDict, total=False):
     message: str          # final message for the user
     # Decisions made by SemIf (or by the fallback), shown in the UI.
     decision_log: Annotated[list[dict], operator.add]
+    # Every LLM call: which model answered (chosen by the router), tokens, cost.
+    llm_log: Annotated[list[dict], operator.add]
 
 
 # ---------------------------------------------------------------------------
-# LLM
+# LLM (see llm_router.py: OpenRouter Auto Router, or gpt-4.1-mini on OpenAI)
 # ---------------------------------------------------------------------------
-# show_spinner=False: LangGraph may run nodes in worker threads, where
-# Streamlit can't draw a spinner (it would raise NoSessionContext).
-@st.cache_resource(show_spinner=False)
-def get_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=0.4,
-        api_key=os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_TOKEN"),
-    )
+def session_for(node: str) -> str:
+    """Router session id: one per trip and node.
+
+    The Auto Router keeps a session on one model unless the task changes. One
+    session per node keeps the research loop on one model (and its prompt
+    cache), while parsing, planning and answering are each routed on their own.
+    """
+    try:
+        thread_id = get_config()["configurable"]["thread_id"]
+    except (KeyError, RuntimeError, TypeError):
+        return str(uuid.uuid4())
+    return f"{thread_id}-{node}"
 
 
 # ---------------------------------------------------------------------------
@@ -251,15 +263,17 @@ Keep destination names in English."""
 
 def parse_request(state: TripState) -> TripState:
     """Turn the free-text request into structured trip details."""
-    llm = get_llm().with_structured_output(TripRequest)
-    trip = llm.invoke([("system", PARSE_PROMPT), ("human", state["request"])])
+    trip, call = call_llm(
+        "Read the request", [("system", PARSE_PROMPT), ("human", state["request"])],
+        schema=TripRequest, session_id=session_for("parse_request"),
+    )
 
     missing = []
     if not trip.destinations:
         missing.append("where you want to go")
     if not trip.days:
         missing.append("how many days the trip is")
-    return {"trip": trip.model_dump(), "missing": missing}
+    return {"trip": trip.model_dump(), "missing": missing, "llm_log": [call]}
 
 
 def route_after_parse(state: TripState) -> str:
@@ -316,18 +330,22 @@ def research_agent(state: TripState) -> TripState:
     history = state.get("messages", []) + new_messages
     rounds = state.get("research_rounds", 0)
 
+    session = session_for("research_agent")
     if rounds >= MAX_RESEARCH_ROUNDS:
         # Out of budget: call the model WITHOUT tools so it must write notes.
         stop = HumanMessage("Stop searching now and write your research notes.")
         new_messages.append(stop)
-        response = get_llm().invoke(history + [stop])
+        response, call = call_llm("Write research notes", history + [stop],
+                                  session_id=session)
     else:
-        response = get_llm().bind_tools(TOOLS).invoke(history)
+        response, call = call_llm("Research", history, tools=TOOLS, session_id=session)
+        if not response.tool_calls:
+            call["purpose"] = "Write research notes"
     new_messages.append(response)
 
     if response.tool_calls:
-        return {"messages": new_messages, "research_rounds": rounds + 1}
-    return {"messages": new_messages, "research_notes": response.content}
+        return {"messages": new_messages, "research_rounds": rounds + 1, "llm_log": [call]}
+    return {"messages": new_messages, "research_notes": response.content, "llm_log": [call]}
 
 
 def route_after_research(state: TripState) -> str:
@@ -423,10 +441,13 @@ def draft_itinerary(state: TripState) -> TripState:
             prompt += FEEDBACK_SECTION.format(feedback="\n".join(f"- {f}" for f in feedback))
         if issues:
             prompt += ISSUES_SECTION.format(issues="\n".join(f"- {i}" for i in issues))
-    llm = get_llm().with_structured_output(Itinerary)
-    itinerary = llm.invoke(prompt)
+    revising = bool(state.get("itinerary") and (issues or feedback))
+    itinerary, call = call_llm(
+        "Revise the itinerary" if revising else "Draft the itinerary", prompt,
+        schema=Itinerary, session_id=session_for("draft_itinerary"),
+    )
 
-    update: TripState = {"itinerary": itinerary.model_dump()}
+    update: TripState = {"itinerary": itinerary.model_dump(), "llm_log": [call]}
     if issues:  # only plan-check revisions count toward MAX_REVISIONS
         update["revision_count"] = state.get("revision_count", 0) + 1
     return update
@@ -778,18 +799,18 @@ Research notes:
 Question: "{question}\""""
 
 
-def answer_question(state: TripState, question_text: str) -> str:
+def answer_question(state: TripState, question_text: str) -> tuple[str, dict]:
     """Answer a question about the trip (LLM), without touching the plan."""
     trip = state["trip"]
-    response = get_llm().invoke(ANSWER_PROMPT.format(
+    response, call = call_llm("Answer a question", ANSWER_PROMPT.format(
         destinations=", ".join(trip["destinations"]),
         days=trip["days"],
         season=trip["season"] or "season not specified",
         itinerary=itinerary_for_prompt(state["itinerary"]),
         notes=state.get("research_notes") or "(no research notes)",
         question=question_text,
-    ))
-    return response.content
+    ), session_id=session_for("answer_question"))
+    return response.content, call
 
 
 def review_message(state: TripState) -> str:
@@ -826,16 +847,18 @@ If they asked for a different trip length, give the new total number of days
 (for example, "two more days" on a 5-day trip means 7). Otherwise return null."""
 
 
-def new_days_from_llm(days: int, answer: str) -> Optional[int]:
-    result = get_llm().with_structured_output(LengthChange).invoke(
-        LENGTH_PROMPT.format(days=days, answer=answer)
-    )
+def new_days_from_llm(days: int, answer: str, calls: list[dict]) -> Optional[int]:
+    result, call = call_llm("Read the new trip length",
+                            LENGTH_PROMPT.format(days=days, answer=answer),
+                            schema=LengthChange, session_id=session_for("review"))
+    calls.append(call)
     return result.new_days
 
 
-def route_with_semif(state: TripState, answer: str, log: list[dict]):
+def route_with_semif(state: TripState, answer: str, log: list[dict], calls: list[dict]):
     """Classify the reply with SemIf. Returns (action, new_days, instructions),
-    or None when SemIf is unavailable or not confident enough."""
+    or None when SemIf is unavailable or not confident enough.
+    Decisions are added to `log`, LLM calls to `calls`."""
     trip = state["trip"]
     # Both questions share one state, so SemIf answers them in one request.
     answers = semif.decide(
@@ -874,7 +897,7 @@ def route_with_semif(state: TripState, answer: str, log: list[dict]):
         log.append(log_decision("review", LENGTH_QUESTION, length,
                                 "used: keep the trip length (no LLM call)"))
         return "change", None, answer
-    new_days = new_days_from_llm(trip["days"], answer)
+    new_days = new_days_from_llm(trip["days"], answer, calls)
     log.append(log_decision(
         "review", LENGTH_QUESTION, length,
         f"asked the LLM for the new length: {new_days or 'unchanged'}",
@@ -891,22 +914,26 @@ def review(state: TripState) -> TripState:
 
     trip = state["trip"]
     log: list[dict] = []
-    routed = route_with_semif(state, answer, log)
+    calls: list[dict] = []
+    routed = route_with_semif(state, answer, log, calls)
     if routed is None:  # Step 5 behaviour: the LLM classifies the reply
-        decision = get_llm().with_structured_output(FeedbackDecision).invoke(
+        decision, call = call_llm(
+            "Classify the reply",
             REVIEW_PROMPT.format(
                 destinations=", ".join(trip["destinations"]),
                 days=trip["days"],
                 earlier="; ".join(state.get("user_feedback") or []) or "none",
                 answer=answer,
-            )
+            ),
+            schema=FeedbackDecision, session_id=session_for("review"),
         )
+        calls.append(call)
         log[-1]["outcome"] += f": {decision.action}"
         routed = decision.action, decision.new_days, decision.instructions
     action, new_days, instructions = routed
 
     # answer_to_question is cleared on every path except 'question' itself
-    update: TripState = {"decision_log": log, "answer_to_question": ""}
+    update: TripState = {"decision_log": log, "llm_log": calls, "answer_to_question": ""}
     if action == "approve":
         return update | {
             "approved": True,
@@ -918,7 +945,8 @@ def review(state: TripState) -> TripState:
     if action == "question":
         # Answer it and come back to this node (route_after_review), so the
         # plan stays as it is and we wait for the next reply.
-        return update | {"answer_to_question": answer_question(state, answer)}
+        reply, call = answer_question(state, answer)
+        return update | {"answer_to_question": reply, "llm_log": calls + [call]}
     # A change request: start a fresh round of drafting and plan checks
     if new_days and new_days != trip["days"]:
         # Update the trip itself, so the planner and the plan check both use the
@@ -985,12 +1013,35 @@ def format_decision(entry: dict) -> str:
             f"({entry['confidence']:.2f}, {entry['seconds']:.1f} s): {entry['outcome']}")
 
 
+def format_call(entry: dict) -> str:
+    """One LLM call as a line of markdown: which model answered, at what cost."""
+    details = []
+    if entry.get("tier"):
+        details.append(f"{entry['tier']}/{entry.get('effort') or '?'}")
+    if entry.get("tokens"):
+        tokens = f"{entry['tokens']} tok"
+        if entry.get("input_tokens") is not None:
+            tokens += f": {entry['input_tokens']} in / {entry['output_tokens']} out"
+            if entry.get("reasoning_tokens"):
+                tokens += f" ({entry['reasoning_tokens']} reasoning)"
+        details.append(tokens)
+    if isinstance(entry.get("cost"), (int, float)):
+        details.append(f"${entry['cost']:.5f}")
+    details.append(f"{entry['seconds']:.1f} s")
+    line = (f"🧭 {entry['purpose']} → **{llm_router.short(entry['model'])}** "
+            f"({', '.join(details)})")
+    if entry.get("note"):
+        line += f" ⚠️ {entry['note']}"
+    return line
+
+
 def describe_step(node: str, output: dict) -> list[str]:
     """Human-readable progress lines for one node update."""
     # Checks that simply passed are left to the Decisions expander.
     decision_lines = [format_decision(e) for e in output.get("decision_log") or []
                       if e["outcome"] != "passed"]
-    return decision_lines + describe_node(node, output)
+    call_lines = [format_call(e) for e in output.get("llm_log") or []]
+    return decision_lines + describe_node(node, output) + call_lines
 
 
 def describe_node(node: str, output: dict) -> list[str]:
@@ -1175,8 +1226,16 @@ with st.sidebar:
         "missing, researches the destinations on Wikipedia, drafts a "
         "day-by-day itinerary, puts it on a map, checks the plan with simple "
         "rules, and then revises it with you until you're happy. Small "
-        "decisions are made by SemIf, a local decision model."
+        "decisions are made by SemIf, a local decision model, and each LLM "
+        "call can be routed to a model by OpenRouter's Auto Router."
     )
+    if llm_router.USE_ROUTER:
+        st.success(f"🧭 LLM: {llm_router.describe_setup()}")
+    else:
+        st.info(
+            f"🧭 LLM: {llm_router.describe_setup()}. Add `OPENROUTER_API_KEY` to `.env` "
+            "to let OpenRouter's Auto Router pick a model for each call."
+        )
     semif_info = semif_status()
     if semif_info:
         st.success(f"🧠 SemIf connected: `{semif_info.get('gguf') or semif_info.get('model')}`")
@@ -1329,6 +1388,54 @@ if values.get("itinerary") and not values.get("new_request"):
                     st.caption(" · ".join(
                         f"{option} {p:.2f}" for option, p in entry["probabilities"].items()
                     ))
+
+    if values.get("llm_log"):
+        calls = values["llm_log"]
+        models = {llm_router.short(c["model"]) for c in calls}
+        costs = [c["cost"] for c in calls if isinstance(c.get("cost"), (int, float))]
+
+        def total(key: str) -> int:
+            return sum(c.get(key) or 0 for c in calls)
+
+        def num(value) -> str:
+            return f"{value:,}" if isinstance(value, int) else "–"
+
+        with st.expander(f"🧭 Models ({len(calls)} LLM calls, {len(models)} model(s))"):
+            summary = (f"{len(calls)} calls, {total('tokens'):,} tokens "
+                       f"({total('input_tokens'):,} input, of which "
+                       f"{total('cached_tokens'):,} cached; {total('output_tokens'):,} output, "
+                       f"of which {total('reasoning_tokens'):,} reasoning), "
+                       f"{sum(c['seconds'] for c in calls):.1f} s of LLM time")
+            if costs:
+                summary += f", ${sum(costs):.4f} (as reported by OpenRouter)"
+            st.caption(f"{summary}. LLM: {llm_router.describe_setup()}.")
+            rows = ["| Step | Model | Router tier / effort | Input (cached) | Output (reasoning) "
+                    "| Total | Cost | Time |",
+                    "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+            for c in calls:
+                tier = f"{c['tier']} / {c.get('effort') or '?'}" if c.get("tier") else "–"
+                cost = f"${c['cost']:.5f}" if isinstance(c.get("cost"), (int, float)) else "–"
+                model = llm_router.short(c["model"]) + (" ⚠️" if c.get("note") else "")
+                rows.append(
+                    f"| {c['purpose']} | `{model}` | {tier} "
+                    f"| {num(c.get('input_tokens'))} ({num(c.get('cached_tokens'))}) "
+                    f"| {num(c.get('output_tokens'))} ({num(c.get('reasoning_tokens'))}) "
+                    f"| {num(c.get('tokens'))} | {cost} | {c['seconds']:.1f} s |"
+                )
+            st.markdown("\n".join(rows))
+            st.caption("Reasoning tokens are a reasoning model's hidden thinking before "
+                       "its answer; they count (and are billed) as output. Cached tokens "
+                       "are input the provider had already seen, usually billed at a discount.")
+            for c in calls:
+                if c.get("candidates") or c.get("note"):
+                    text = f"**{c['purpose']}**"
+                    if c.get("candidates"):
+                        text += " · candidates: " + ", ".join(c["candidates"])
+                    if c.get("reason"):
+                        text += f" · router: {c['reason']}"
+                    if c.get("note"):
+                        text += f" · ⚠️ {c['note']}"
+                    st.caption(text)
 
     if values.get("unlocated"):
         with st.expander(f"❔ Not found on the map ({len(values['unlocated'])})"):
